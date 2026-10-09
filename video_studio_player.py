@@ -93,7 +93,7 @@ from PyQt5.QtCore import (  # noqa: E402
 )
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt5.QtGui import (  # noqa: E402
-    QPainter, QColor, QPen, QRegion, QPalette,
+    QPainter, QColor, QPen, QRegion, QPalette, QCursor,
 )
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -257,6 +257,10 @@ class VideoFrame(QFrame):
         self.setAttribute(Qt.WA_PaintOnScreen, True)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(False)
+        # Açık (explicit) ok imleci: aksi halde CentralWidget'ın kenar
+        # şeridinde ayarladığı yeniden boyutlandırma imleci bu native
+        # pencereye miras kalıp takılı kalıyor.
+        self.setCursor(Qt.ArrowCursor)
 
     def mousePressEvent(self, event):
         self.window().setFocus()
@@ -284,6 +288,12 @@ class VideoFrame(QFrame):
 # --------------------------------------------------------------------------- #
 class TitleBar(QWidget):
     doubleClicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Açık ok imleci: CentralWidget'ın yeniden boyutlandırma imleci
+        # üst çubuğa (ve düğmelerine) miras kalmasın.
+        self.setCursor(Qt.ArrowCursor)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -350,8 +360,18 @@ class CentralWidget(QWidget):
         else:
             edge = self._edge_at(event.pos())
             cursor = self._CURSOR_MAP.get(edge) if edge else None
-            self.setCursor(cursor) if cursor else self.unsetCursor()
+            if cursor is not None:
+                self.setCursor(cursor)
+            else:
+                self.unsetCursor()
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        # Fare kenar şeridinden hızlıca bir native çocuk pencereye (video,
+        # üst çubuk vb.) geçerse buraya mouseMove gelmez; imleç takılı
+        # kalmasın diye çıkışta açıkça sıfırlıyoruz.
+        self.unsetCursor()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if (
@@ -482,6 +502,7 @@ class IdleSignalWidget(QWidget):
         self.setAttribute(Qt.WA_DontCreateNativeAncestors)
         self.setAttribute(Qt.WA_NativeWindow)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setCursor(Qt.ArrowCursor)
 
         self._bar_visible = True
         self._blink_timer = QTimer(self)
@@ -564,6 +585,7 @@ class CropOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAutoFillBackground(False)
         self.setMouseTracking(True)
+        self.setCursor(Qt.ArrowCursor)
         self._active = False
         self._video_rect = QRect()
         self._crop = QRect()
@@ -575,7 +597,7 @@ class CropOverlay(QWidget):
     def set_active(self, active: bool):
         self._active = active
         self.setAttribute(Qt.WA_TransparentForMouseEvents, not active)
-        self.unsetCursor()
+        self.setCursor(Qt.ArrowCursor)
         self.setVisible(active)
         if active:
             self._update_mask()
@@ -704,7 +726,7 @@ class CropOverlay(QWidget):
             elif self._crop.contains(event.pos()):
                 self.setCursor(Qt.SizeAllCursor)
             else:
-                self.unsetCursor()
+                self.setCursor(Qt.ArrowCursor)
             return
 
         delta = event.pos() - self._start_mouse_pos
@@ -1100,6 +1122,15 @@ class VideoStudioPlayer(QMainWindow):
         self._export_field_order = None
         self._music_id_worker = None
 
+        # Tam ekranda hareketsiz kalan fare imlecini gizleme (bkz.
+        # _update_cursor_autohide / _cursor_autohide_tick).
+        self._cursor_hidden = False
+        self._cursor_idle_ticks = 0
+        self._cursor_last_pos = None
+        self._cursor_idle_timer = QTimer(self)
+        self._cursor_idle_timer.setInterval(100)
+        self._cursor_idle_timer.timeout.connect(self._cursor_autohide_tick)
+
         self._build_ui()
         self._connect_signals()
         self._disable_child_focus()
@@ -1226,6 +1257,7 @@ class VideoStudioPlayer(QMainWindow):
         video_container = QWidget()
         video_container.setLayout(video_area)
         main_layout.addWidget(video_container, 1)
+        video_container.setCursor(Qt.ArrowCursor)
         self.idle_logo.raise_()
 
         self.lbl_dim = QLabel(video_container)
@@ -1430,6 +1462,14 @@ class VideoStudioPlayer(QMainWindow):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color:#4caf50; padding: 4px 10px;")
         main_layout.addWidget(self.status_label)
+
+        # Kenar şeridindeki yeniden boyutlandırma imleci bu bölümlere miras
+        # kalmasın diye hepsine açık ok imleci veriyoruz (çocuk widget'lar
+        # - slider, düğme vb. - bunu miras alır; kendi imleci olanlar, ör.
+        # TrimBar, kendi imlecini korur).
+        for w in (self.controls_panel, self.separator_line,
+                  self.edit_panel, self.status_label):
+            w.setCursor(Qt.ArrowCursor)
 
         self._apply_content_margins()
 
@@ -1752,7 +1792,53 @@ class VideoStudioPlayer(QMainWindow):
                 w.setVisible(False)
             self.showFullScreen()
         self._apply_content_margins()
+        self._update_cursor_autohide()
         self.setFocus()
+
+    # Tam ekranda imleç bu kadar süre (100 ms'lik tik) hareketsiz kalırsa
+    # gizlenir; fare oynayınca hemen geri gelir. 20 tik = 2 saniye.
+    CURSOR_HIDE_TICKS = 20
+
+    def _update_cursor_autohide(self):
+        """Tam ekrana girince imleç gizlemeyi başlatır, çıkınca durdurur ve
+        imleci eski haline getirir. İki katmanlı çalışır: mpv'nin kendi
+        'cursor-autohide' seçeneği (mpv penceresi imleci kendi yönettiği
+        için) + Qt tarafında zamanlayıcıyla video alanının imleci."""
+        fs = self.isFullScreen()
+        try:
+            if self.player is not None:
+                self.player["cursor-autohide"] = 2000 if fs else "no"
+        except Exception:
+            pass
+
+        self._cursor_idle_ticks = 0
+        self._cursor_last_pos = QCursor.pos()
+        if fs:
+            self._cursor_idle_timer.start()
+        else:
+            self._cursor_idle_timer.stop()
+            self._show_cursor()
+
+    def _hide_cursor(self):
+        if not self._cursor_hidden:
+            self._cursor_hidden = True
+            self.video_frame.setCursor(Qt.BlankCursor)
+
+    def _show_cursor(self):
+        if self._cursor_hidden:
+            self._cursor_hidden = False
+            self.video_frame.setCursor(Qt.ArrowCursor)
+
+    def _cursor_autohide_tick(self):
+        pos = QCursor.pos()
+        if pos != self._cursor_last_pos:
+            self._cursor_last_pos = pos
+            self._cursor_idle_ticks = 0
+            self._show_cursor()
+            return
+        self._cursor_idle_ticks += 1
+        if self._cursor_idle_ticks >= self.CURSOR_HIDE_TICKS:
+            self._hide_cursor()
 
     def _apply_content_margins(self):
         """Pencere normal (ne büyütülmüş ne tam ekran) haldeyken kenarlarda
