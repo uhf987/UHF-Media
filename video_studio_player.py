@@ -45,6 +45,7 @@ import sys
 import subprocess
 import math
 import functools
+import time
 import asyncio
 import wave
 import re
@@ -93,7 +94,7 @@ from PyQt5.QtCore import (  # noqa: E402
 )
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt5.QtGui import (  # noqa: E402
-    QPainter, QColor, QPen, QRegion, QPalette, QCursor,
+    QPainter, QColor, QPen, QRegion, QPalette, QCursor, QIcon,
 )
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -116,6 +117,13 @@ def _binary_path(name: str) -> str:
     if os.path.isfile(candidate):
         return candidate
     return name  # PATH üzerinden çözülsün
+
+
+def resource_path(name: str) -> str:
+    """PyInstaller ile paketlenmiş dosyaların (ör. icon.ico) yolunu çözer.
+    Paketlenmişken sys._MEIPASS, script olarak çalışırken .py'nin klasörü."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
 
 
 FFMPEG = _binary_path("ffmpeg")
@@ -204,12 +212,35 @@ def aspect_ratio_str(w: int, h: int) -> str:
 #  Tıklanan konuma doğrudan atlayan slider (main.py)
 # --------------------------------------------------------------------------- #
 class ClickableSlider(QSlider):
+    # GOM Player gibi esnek davranış: çubuğun HERHANGİ bir yerine tıklayınca
+    # tutamaç oraya atlar ve aynı tıklamayla sürüklemeye devam edilebilir.
+    # Eskiden tıklama Qt'nin varsayılan işlemine bırakılıyordu; tıklama
+    # tutamacın tam üstüne denk gelmezse "sürükleme başladı" (sliderPressed)
+    # sinyali hiç gönderilmiyor, dolayısıyla atlama uygulanmıyor ve zamanlayıcı
+    # çubuğu eski yerine geri çekiyordu. Artık sürükleme durumunu kendimiz
+    # yönetiyoruz, tıklamanın nereye denk geldiği fark etmiyor.
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            value = self._value_from_pos(event.pos())
-            self.setValue(value)
-            self.sliderMoved.emit(value)
+            self.setSliderDown(True)  # sliderPressed sinyalini yayar
+            self.setSliderPosition(self._value_from_pos(event.pos()))
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown():
+            self.setSliderPosition(self._value_from_pos(event.pos()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            self.setSliderPosition(self._value_from_pos(event.pos()))
+            self.setSliderDown(False)  # sliderReleased sinyalini yayar
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _value_from_pos(self, pos):
         opt = QStyleOptionSlider()
@@ -221,12 +252,12 @@ class ClickableSlider(QSlider):
             length = handle.width()
             smin = groove.x()
             smax = groove.right() - length + 1
-            p = pos.x()
+            p = pos.x() - length // 2  # tutamacı tıklanan noktaya ORTALA
         else:
             length = handle.height()
             smin = groove.y()
             smax = groove.bottom() - length + 1
-            p = pos.y()
+            p = pos.y() - length // 2
 
         return QStyle.sliderValueFromPosition(
             self.minimum(), self.maximum(), p - smin, smax - smin, opt.upsideDown
@@ -939,6 +970,67 @@ class TrimBar(QWidget):
 # --------------------------------------------------------------------------- #
 #  Arka planda ffmpeg çalıştıran thread (video_studio.py)
 # --------------------------------------------------------------------------- #
+class FullscreenControls(QWidget):
+    """Tam ekranda fare ekranın alt kenarına gelince beliren, uzaklaşınca
+    kaybolan kontrol çubuğu (oynat/duraklat + ilerletme çubuğu + zaman).
+
+    NEDEN ayrı bir üst düzey pencere? mpv, video_frame'in NATIVE penceresine
+    çizim yapıyor; sıradan bir child widget bunun ÜZERİNDE görünemez. Bu
+    yüzden bağımsız, çerçevesiz, her zaman üstte duran bir 'Tool' penceresi
+    kullanıyoruz ve ekranın altına kendimiz konumlandırıyoruz."""
+
+    HEIGHT = 64
+
+    def __init__(self, owner, seek_range):
+        super().__init__(owner, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self._owner = owner
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setCursor(Qt.ArrowCursor)
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor(20, 20, 20))
+        self.setPalette(pal)
+        self.setWindowOpacity(0.92)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setSpacing(12)
+
+        self.play_btn = QPushButton("▶")
+        self.play_btn.setFixedSize(40, 32)
+        self.play_btn.setFocusPolicy(Qt.NoFocus)
+        layout.addWidget(self.play_btn)
+
+        self.seek_slider = ClickableSlider(Qt.Horizontal)
+        self.seek_slider.setRange(0, seek_range)
+        self.seek_slider.setMinimumHeight(22)
+        self.seek_slider.setFocusPolicy(Qt.NoFocus)
+        layout.addWidget(self.seek_slider, 1)
+
+        self.time_label = QLabel("00:00 / 00:00")
+        layout.addWidget(self.time_label)
+
+    def update_state(self, slider_value, time_text, paused):
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setValue(slider_value)
+        self.seek_slider.blockSignals(False)
+        self.time_label.setText(time_text)
+        self.play_btn.setText("▶" if paused else "⏸")
+
+    def show_at_bottom(self, screen_rect):
+        self.setGeometry(screen_rect.x(), screen_rect.bottom() - self.HEIGHT + 1,
+                         screen_rect.width(), self.HEIGHT)
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+
+    def keyPressEvent(self, event):
+        # Bu pencereye tıklanınca klavye odağı buraya geçebilir; ileri/geri
+        # sarma, boşluk, Esc gibi tuşlar yine ana pencerede çalışsın.
+        self._owner.keyPressEvent(event)
+
+
 class ExportWorker(QThread):
     finished_ok = pyqtSignal(str)
     finished_err = pyqtSignal(str)
@@ -1099,7 +1191,8 @@ class VideoStudioPlayer(QMainWindow):
         # Native (Windows'un kendi) başlık çubuğunu tamamen kaldırıyoruz;
         # pencereyi taşıma/yeniden boyutlandırma artık nativeEvent() içinde
         # ELLE yönetiliyor (bkz. aşağıdaki nativeEvent metodu).
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowMinimizeButtonHint)
+        self.setWindowIcon(QIcon(resource_path("icon.ico")))
         self.resize(1100, 780)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1132,6 +1225,7 @@ class VideoStudioPlayer(QMainWindow):
         self._cursor_idle_timer.timeout.connect(self._cursor_autohide_tick)
 
         self._build_ui()
+        self.fs_controls = FullscreenControls(self, self.SEEK_RANGE)
         self._connect_signals()
         self._disable_child_focus()
 
@@ -1275,7 +1369,8 @@ class VideoStudioPlayer(QMainWindow):
 
         seek_layout = QHBoxLayout()
         self.seek_slider = ClickableSlider(Qt.Horizontal)
-        self.seek_slider.setRange(0, 1000)
+        self.seek_slider.setRange(0, self.SEEK_RANGE)
+        self.seek_slider.setMinimumHeight(22)  # tıklaması/tutması daha kolay
         self.time_label = QLabel("00:00 / 00:00")
 
         # ---- kesme (trim) çubuğu: makas işaretlenince zaman çizgisinin
@@ -1486,6 +1581,15 @@ class VideoStudioPlayer(QMainWindow):
         self.btn_mono_r.toggled.connect(self._on_mono_r_toggled)
         self.volume_slider.valueChanged.connect(self.set_volume)
         self.seek_slider.sliderPressed.connect(self._seek_start)
+        self.seek_slider.sliderMoved.connect(self._seek_moved)
+
+        # Tam ekran alt kontrol çubuğu: aynı ilerletme işleyicilerini kullanır
+        fsc = self.fs_controls
+        fsc.play_btn.clicked.connect(self.toggle_play)
+        fsc.play_btn.clicked.connect(self._sync_fs_controls)
+        fsc.seek_slider.sliderPressed.connect(self._seek_start)
+        fsc.seek_slider.sliderMoved.connect(self._seek_moved)
+        fsc.seek_slider.sliderReleased.connect(self._seek_end)
         self.seek_slider.sliderReleased.connect(self._seek_end)
         self.audio_combo.currentIndexChanged.connect(self._on_audio_changed)
         self.subtitle_combo.currentIndexChanged.connect(self._on_subtitle_changed)
@@ -1711,21 +1815,57 @@ class VideoStudioPlayer(QMainWindow):
         except Exception:
             pass
 
+    SEEK_RANGE = 10000  # çubuk çözünürlüğü (eskiden 1000'di: 2 saatlik filmde ~7 sn/adım)
+
     def _seek_start(self):
         self.is_seeking = True
+        self._last_live_seek = 0.0
+
+    def _seek_moved(self, value):
+        """Sürüklerken: hedef zamanı etikette göster ve videoyu canlı olarak
+        o ana (hızlı, anahtar kare hassasiyetinde) atlat - GOM Player gibi."""
+        try:
+            duration = self.player.duration
+        except Exception:
+            duration = None
+        if not duration:
+            return
+        target = (value / self.SEEK_RANGE) * duration
+        text = f"{fmt_time(target)} / {fmt_time(duration)}"
+        if not self.chk_trim.isChecked():
+            self.time_label.setText(text)
+        self.fs_controls.time_label.setText(text)
+        now = time.monotonic()
+        if now - getattr(self, "_last_live_seek", 0.0) >= 0.08:
+            self._last_live_seek = now
+            try:
+                self.player.command("seek", target, "absolute+keyframes")
+            except Exception:
+                pass
 
     def _seek_end(self):
         try:
             duration = self.player.duration
         except Exception:
             duration = None
+        # Hangi çubuktan (ana ya da tam ekran) bırakıldıysa onun değerini kullan
+        sender = self.sender()
+        slider = sender if isinstance(sender, QSlider) else self.seek_slider
+        if slider is not self.seek_slider:
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(slider.value())
+            self.seek_slider.blockSignals(False)
         if duration:
-            new_time = (self.seek_slider.value() / 1000) * duration
+            new_time = (slider.value() / self.SEEK_RANGE) * duration
             try:
-                self.player.time_pos = new_time
+                # Bırakınca tam (kare hassasiyetli) atlama
+                self.player.command("seek", new_time, "absolute")
             except Exception:
                 pass
         self.is_seeking = False
+        # mpv seek'i asenkron: hemen ardından time_pos hâlâ ESKİ konumu
+        # bildirebilir ve zamanlayıcı çubuğu bir an geri çekerdi.
+        self._seek_hold_until = time.monotonic() + 0.4
 
     def _update_ui(self):
         if self.is_seeking:
@@ -1745,10 +1885,11 @@ class VideoStudioPlayer(QMainWindow):
         except Exception:
             pass
 
-        if duration and current is not None:
-            pos = int((current / duration) * 1000)
+        if (duration and current is not None
+                and time.monotonic() >= getattr(self, "_seek_hold_until", 0.0)):
+            pos = int((current / duration) * self.SEEK_RANGE)
             self.seek_slider.blockSignals(True)
-            self.seek_slider.setValue(max(0, min(1000, pos)))
+            self.seek_slider.setValue(max(0, min(self.SEEK_RANGE, pos)))
             self.seek_slider.blockSignals(False)
 
         # Kesme (trim) modu aktifken zaman etiketi seçili aralığı gösterir
@@ -1764,6 +1905,47 @@ class VideoStudioPlayer(QMainWindow):
             self.play_btn.setText("▶" if self.player.pause else "⏸")
         except Exception:
             pass
+
+        self._sync_fs_controls()
+
+    def _sync_fs_controls(self):
+        """Tam ekran alt çubuğunu oynatıcının güncel durumuyla eşitler."""
+        fsc = self.fs_controls
+        if not fsc.isVisible() or fsc.seek_slider.isSliderDown():
+            return
+        try:
+            duration = self.player.duration
+            current = self.player.time_pos
+            paused = bool(self.player.pause)
+        except Exception:
+            return
+        fsc.update_state(
+            self.seek_slider.value(),
+            f"{fmt_time(current)} / {fmt_time(duration)}",
+            paused,
+        )
+
+    # Tam ekranda fare ekranın alt kenarından bu kadar piksel içeri girince
+    # kontrol çubuğu görünür.
+    FS_ZONE = 120
+
+    def _update_fs_controls(self, pos):
+        fsc = self.fs_controls
+        if not self.isFullScreen():
+            fsc.hide()
+            return
+        # Başka bir programa geçildiyse (Alt+Tab vb.) çubuk ekranda kalmasın.
+        active = QApplication.activeWindow()
+        if active is not self and active is not fsc:
+            fsc.hide()
+            return
+        screen = QApplication.desktop().screenGeometry(self)
+        in_zone = screen.contains(pos) and pos.y() >= screen.bottom() - self.FS_ZONE
+        if in_zone or fsc.seek_slider.isSliderDown():
+            fsc.show_at_bottom(screen)
+            self._sync_fs_controls()
+        else:
+            fsc.hide()
 
     # ------------------------------------------------------------- klavye
     def keyPressEvent(self, event):
@@ -1818,6 +2000,7 @@ class VideoStudioPlayer(QMainWindow):
         else:
             self._cursor_idle_timer.stop()
             self._show_cursor()
+            self.fs_controls.hide()
 
     def _hide_cursor(self):
         if not self._cursor_hidden:
@@ -1831,6 +2014,7 @@ class VideoStudioPlayer(QMainWindow):
 
     def _cursor_autohide_tick(self):
         pos = QCursor.pos()
+        self._update_fs_controls(pos)
         if pos != self._cursor_last_pos:
             self._cursor_last_pos = pos
             self._cursor_idle_ticks = 0
@@ -2641,7 +2825,20 @@ def apply_dark_theme(app: QApplication):
 
 
 def main():
+    # Windows görev çubuğunda uygulamanın KENDİ simgesiyle ve ayrı bir
+    # uygulama olarak görünmesi için (aksi halde python/genel grup altında
+    # toplanıp simge kaybolabiliyor). QApplication'dan ÖNCE çağrılmalı.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "HuluMedia.VideoStudioPlayer.1"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(resource_path("icon.ico")))
     apply_dark_theme(app)
 
     candidate = None
