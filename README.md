@@ -1,3 +1,5 @@
+<img width="681" height="590" alt="Ekran görüntüsü 2026-10-14 214510" src="https://github.com/user-attachments/assets/7f12c49b-d936-4d1e-b8f1-0c4513f3e710" />
+
 # UHF-Media Video Studio Player
 
 A desktop video player (Windows, PyQt5 + libmpv) with built‑in editing tools —
